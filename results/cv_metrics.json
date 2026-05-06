@@ -1,0 +1,26 @@
+{
+  "logreg": {
+    "n_clips": 234,
+    "n_dogs": 12,
+    "clip_accuracy": 0.5811965811965812,
+    "clip_auc": 0.6011904761904763,
+    "dog_accuracy": 0.6666666666666666,
+    "dog_auc": 0.75
+  },
+  "random_forest": {
+    "n_clips": 234,
+    "n_dogs": 12,
+    "clip_accuracy": 0.7435897435897436,
+    "clip_auc": 0.782039976484421,
+    "dog_accuracy": 0.8333333333333334,
+    "dog_auc": 0.9722222222222223
+  },
+  "xgboost": {
+    "n_clips": 234,
+    "n_dogs": 12,
+    "clip_accuracy": 0.717948717948718,
+    "clip_auc": 0.7730746619635509,
+    "dog_accuracy": 0.8333333333333334,
+    "dog_auc": 0.9722222222222223
+  }
+}

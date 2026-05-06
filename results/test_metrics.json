@@ -1,0 +1,31 @@
+{
+  "model_name": "random_forest",
+  "holdout": {
+    "ccl": "Reggie Bell 927479",
+    "normal": "Zane Kleva 976315"
+  },
+  "clip": {
+    "accuracy": 0.9464285714285714,
+    "auc": 0.9751461988304093,
+    "precision_normal": 0.926829268292683,
+    "precision_ccl": 1.0,
+    "recall_normal": 1.0,
+    "recall_ccl": 0.8333333333333334,
+    "f1_normal": 0.9620253164556962,
+    "f1_ccl": 0.9090909090909091,
+    "confusion_matrix": [
+      [
+        38,
+        0
+      ],
+      [
+        3,
+        15
+      ]
+    ]
+  },
+  "dog": {
+    "accuracy": 1.0,
+    "auc": 1.0
+  }
+}
