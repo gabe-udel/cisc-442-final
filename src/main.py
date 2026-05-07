@@ -35,10 +35,10 @@ RESULTS_DIR  = PROJECT_ROOT / "results"
 
 # --- Stage toggles ---------------------------------------------------------
 RUN_VISUALIZE        = True   # Stage 1: render pose on a single demo video
-RUN_BUILD_INDEX      = True  # Stage 2: scan dataset for usable lateral clips
-RUN_EXTRACT_FEATURES = True  # Stage 3: pose -> per-clip feature CSV
-RUN_TRAIN            = True  # Stage 4: LOO-CV + persist winning classifier
-RUN_EVALUATE         = True  # Stage 5: holdout-set scoring of saved model
+RUN_BUILD_INDEX      = False  # Stage 2: scan dataset for usable lateral clips
+RUN_EXTRACT_FEATURES = False  # Stage 3: pose -> per-clip feature CSV
+RUN_TRAIN            = False  # Stage 4: LOO-CV + persist winning classifier
+RUN_EVALUATE         = False  # Stage 5: holdout-set scoring of saved model
 
 # --- Stage 1: single-video visualization -----------------------------------
 # Path to the clip the visualization stage will pose-annotate. Relative paths
