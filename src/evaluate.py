@@ -1,24 +1,9 @@
-"""Evaluate the trained CCL classifier on the held-out dogs.
-
-Loads the pipeline saved by `train.py`, applies it to the two dogs that were
-withheld during training, and reports both clip-level and dog-level metrics.
-
-Outputs:
-    results/test_metrics.json      # final test scores
-    results/test_predictions.csv   # per-clip true/pred/proba for inspection
-
-Run:
-    python src/evaluate.py
-"""
-
-from __future__ import annotations
+# evaluate.py - scores the saved model on the two holdout dogs
 
 import argparse
 import json
-from pathlib import Path
 
 import joblib
-import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
@@ -51,7 +36,7 @@ def main():
     model_name = artifact.get("model_name", "?")
     holdout = json.loads(HOLDOUT_PATH.read_text())
 
-    # Slice the held-out dogs out of the feature matrix.
+    # pull out only the holdout dogs from the full feature table
     test_df = df[df["dog_id"].isin([holdout["ccl"], holdout["normal"]])].reset_index(drop=True)
     if test_df.empty:
         raise SystemExit(f"No clips in features.csv match holdout dogs {holdout}.")
@@ -66,24 +51,24 @@ def main():
     print(f"Test set: {len(test_df)} clips ({(y == 1).sum()} CCL, {(y == 0).sum()} Normal)")
     print()
 
-    # ---- Clip-level metrics -----------------------------------------------
+    # clip-level metrics
     metrics = {"model_name": model_name, "holdout": holdout, "clip": {}, "dog": {}}
     metrics["clip"]["accuracy"] = float(accuracy_score(y, pred))
     try:
         metrics["clip"]["auc"] = float(roc_auc_score(y, proba))
     except ValueError:
         metrics["clip"]["auc"] = float("nan")
-    prec, rec, f1, _ = precision_recall_fscore_support(
-        y, pred, labels=[0, 1], zero_division=0
-    )
+
+    prec, rec, f1, _ = precision_recall_fscore_support(y, pred, labels=[0, 1], zero_division=0)
     metrics["clip"]["precision_normal"] = float(prec[0])
     metrics["clip"]["precision_ccl"] = float(prec[1])
     metrics["clip"]["recall_normal"] = float(rec[0])
     metrics["clip"]["recall_ccl"] = float(rec[1])
     metrics["clip"]["f1_normal"] = float(f1[0])
     metrics["clip"]["f1_ccl"] = float(f1[1])
+
     cm = confusion_matrix(y, pred, labels=[0, 1])
-    metrics["clip"]["confusion_matrix"] = cm.tolist()  # rows=true, cols=pred
+    metrics["clip"]["confusion_matrix"] = cm.tolist()
 
     print("=== Clip-level ===")
     print(f"  Accuracy         : {metrics['clip']['accuracy']:.3f}")
@@ -97,7 +82,7 @@ def main():
     print(f"     true=CCL     -> pred(Norm)={cm[1,0]}  pred(CCL)={cm[1,1]}")
     print()
 
-    # ---- Dog-level metrics: average clip probability per dog --------------
+    # dog-level metrics - average clip probability per dog then threshold
     dog_df = pd.DataFrame({
         "dog_id": test_df["dog_id"],
         "true": y,
@@ -110,6 +95,7 @@ def main():
     )
     agg["pred"] = (agg["proba_mean"] >= 0.5).astype(int)
     agg["correct"] = (agg["pred"] == agg["true"]).astype(int)
+
     print("=== Dog-level ===")
     for dog_id, row in agg.iterrows():
         label_str = "CCL" if row["true"] == 1 else "Normal"
@@ -123,10 +109,11 @@ def main():
         metrics["dog"]["auc"] = float(roc_auc_score(agg["true"], agg["proba_mean"]))
     except ValueError:
         metrics["dog"]["auc"] = float("nan")
+
     print(f"\n  Dog accuracy: {metrics['dog']['accuracy']:.3f}")
     print(f"  Dog AUC     : {metrics['dog']['auc']:.3f}")
 
-    # ---- Persist artifacts ------------------------------------------------
+    # write output files
     test_df_out = test_df[["video_path", "dog_id", "dog_name", "label"]].copy()
     test_df_out["pred"] = pred
     test_df_out["proba_ccl"] = proba

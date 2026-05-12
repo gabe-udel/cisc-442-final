@@ -1,238 +1,149 @@
-"""Discover usable training clips from the CISC-442 dog-video dataset.
-
-Goal of this module
--------------------
-Produce a tidy list of `Clip` records — one per usable video — that downstream
-feature extraction can iterate over without worrying about folder layout or
-view filtering.
-
-Source layout (read-only):
-    <DATA_ROOT>/
-        CCL Cases/<DogName ID>/<DogName> Gait Videos/
-            <Visit-folder>/        # we keep ONLY *Baseline* folders
-                possibly nested by view (L Sag/R Sag/etc.) or flat IMG_xxxx.MOV
-        Normals/<DogName ID>/<DogName> Gait Videos/
-            <flat or per-view folders>
-
-What we keep
-------------
-* CCL: only files inside *Baseline* visit folders (skip Surgery/Post-op).
-* Normal: every gait video.
-* Lateral (left/right side) views only — front/back views are filtered out by
-  per-video bbox-motion analysis (horizontal motion must dominate vertical).
-* We also crop each lateral video to the contiguous frame range where the dog
-  is actually moving (drops standing/intro/outro padding).
-
-The motion analysis runs once per video and is cached to
-`results/view_index.json` so repeated training runs don't redo it.
-
-Run as a module to populate / inspect the cache:
-    python src/dataset.py             # full scan, cached
-    python src/dataset.py --sample 1  # 1 video per dog (smoke test)
-"""
-
-from __future__ import annotations
+# dataset.py - finds and filters usable lateral gait clips from the dog video folder
 
 import argparse
 import json
 import os
-import sys
 import time
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 import numpy as np
 from PIL import Image
 
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-
-# Project root resolved from this file so cwd doesn't matter.
+# project paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Dataset lives at <repo>/videos/cisc442 dog videos. DOG_DATA_ROOT env var
-# overrides for machines where it lives elsewhere.
+# where the dog videos live (can be overridden with the DOG_DATA_ROOT env variable)
 DEFAULT_DATA_ROOT = Path(os.environ.get(
     "DOG_DATA_ROOT",
     str(PROJECT_ROOT / "videos" / "cisc442 dog videos"),
 ))
 
-# Where we cache the per-video motion analysis. Project-local so it travels
-# with the code, but ignored if the videos themselves change.
 RESULTS_DIR = PROJECT_ROOT / "results"
 VIEW_INDEX_PATH = RESULTS_DIR / "view_index.json"
 
 
-# ---------------------------------------------------------------------------
-# Data class for one usable clip
-# ---------------------------------------------------------------------------
-
-@dataclass
+# one usable clip - a single video with metadata
 class Clip:
-    """One video clip we want to extract pose features from.
-
-    Attributes:
-        video_path: absolute path to the .MOV
-        dog_id:     unique per-dog string (folder name including the trailing
-                    numeric ID — this is what we group on for LOOCV)
-        dog_name:   human-readable dog name (folder name minus the ID)
-        label:      1 = CCL injury, 0 = healthy normal
-        direction:  'LR' (dog walks left→right, camera sees right side) or
-                    'RL' (dog walks right→left, camera sees left side)
-        start_frame, end_frame: inclusive gait-window range. Pose extraction
-                    should iterate frames in [start, end].
-        n_frames:   total frame count in the source video (for sanity).
-        fps:        source fps (for stride-frequency conversion).
-    """
-    video_path: str
-    dog_id: str
-    dog_name: str
-    label: int
-    direction: str
-    start_frame: int
-    end_frame: int
-    n_frames: int
-    fps: float
+    def __init__(self, video_path, dog_id, dog_name, label, direction, start_frame, end_frame, n_frames, fps):
+        self.video_path = video_path
+        self.dog_id = dog_id
+        self.dog_name = dog_name
+        self.label = label           # 1 = ccl injured, 0 = healthy
+        self.direction = direction   # 'LR' or 'RL'
+        self.start_frame = start_frame
+        self.end_frame = end_frame
+        self.n_frames = n_frames
+        self.fps = fps
 
     @property
-    def gait_length(self) -> int:
+    def gait_length(self):
+        # number of frames in the walking window
         return self.end_frame - self.start_frame + 1
 
 
-# ---------------------------------------------------------------------------
-# Filesystem walk: enumerate candidate videos before any motion analysis
-# ---------------------------------------------------------------------------
-
-def _is_baseline_folder(name: str) -> bool:
-    """Folder name says 'baseline' (case-insensitive). Visits like 'Surgery',
-    '6 Weeks Post Op', '8 Weeks rads', '6 months pos-op' all fail this check."""
+# return True if this folder name refers to a baseline visit
+def _is_baseline_folder(name):
     return "baseline" in name.lower()
 
 
-def _gait_videos_dir(dog_dir: Path) -> Path | None:
-    """Return the dog's '<Name> Gait Videos' subfolder, or None if missing."""
+# find the "gait videos" subfolder inside a dog folder
+def _gait_videos_dir(dog_dir):
     for sub in dog_dir.iterdir():
         if sub.is_dir() and "gait videos" in sub.name.lower():
             return sub
     return None
 
 
-def _all_movs_under(root: Path) -> list[Path]:
-    """Recursively gather every .MOV / .mp4 under `root` (case-insensitive)."""
-    out: list[Path] = []
+# collect all video files under a folder recursively
+def _all_movs_under(root):
+    out = []
     for p in root.rglob("*"):
         if p.is_file() and p.suffix.lower() in (".mov", ".mp4"):
             out.append(p)
     return out
 
 
-def list_candidate_videos(
-    data_root: Path = DEFAULT_DATA_ROOT,
-    limit_per_dog: int | None = None,
-) -> list[tuple[Path, str, str, int]]:
-    """Walk the dataset and return (video_path, dog_id, dog_name, label) tuples.
+# walk the dataset and return a list of (video_path, dog_id, dog_name, label)
+def list_candidate_videos(data_root=DEFAULT_DATA_ROOT, limit_per_dog=None):
+    out = []
 
-    A "candidate" hasn't been view-classified yet — we only know it's a gait
-    video from a relevant dog/visit. The motion analysis later decides if it's
-    actually a usable lateral clip.
-
-    `dog_id` is the full folder name (e.g. "Ash Swider 912908"); using it as
-    the LOOCV grouping key avoids mixing two different dogs that happen to
-    share a first name.
-
-    `limit_per_dog`: if set, take at most N evenly-spaced candidates per dog
-    (BEFORE motion analysis). This makes smoke tests tractable — the full
-    motion-analysis scan over ~450 videos can take >1 hour on CPU.
-    """
-    out: list[tuple[Path, str, str, int]] = []
-
-    def _take(items: list[Path]) -> list[Path]:
+    # take only N evenly spaced items from a list (for smoke testing)
+    def take_limited(items):
         if limit_per_dog is None or limit_per_dog >= len(items):
             return items
+        result = []
         step = len(items) / limit_per_dog
-        return [items[int(i * step)] for i in range(limit_per_dog)]
+        for i in range(limit_per_dog):
+            result.append(items[int(i * step)])
+        return result
 
+    # ccl cases - only use baseline visit folders, skip post-op
     ccl_root = data_root / "CCL Cases"
     if ccl_root.is_dir():
         for dog_dir in sorted(ccl_root.iterdir()):
             if not dog_dir.is_dir():
                 continue
             dog_id = dog_dir.name
-            dog_name = " ".join(dog_id.split()[:-1]) or dog_id  # drop trailing numeric ID
+            dog_name = " ".join(dog_id.split()[:-1])
+            if dog_name == "":
+                dog_name = dog_id
             gait_dir = _gait_videos_dir(dog_dir)
             if gait_dir is None:
                 continue
-            # Only the Baseline visit folder(s) for CCL dogs.
-            dog_movs: list[Path] = []
+            dog_movs = []
             for visit in gait_dir.iterdir():
                 if visit.is_dir() and _is_baseline_folder(visit.name):
                     dog_movs.extend(_all_movs_under(visit))
-            for mov in _take(sorted(dog_movs)):
+            for mov in take_limited(sorted(dog_movs)):
                 out.append((mov, dog_id, dog_name, 1))
 
+    # healthy normals - use all videos
     normals_root = data_root / "Normals"
     if normals_root.is_dir():
         for dog_dir in sorted(normals_root.iterdir()):
             if not dog_dir.is_dir():
                 continue
             dog_id = dog_dir.name
-            dog_name = " ".join(dog_id.split()[:-1]) or dog_id
+            dog_name = " ".join(dog_id.split()[:-1])
+            if dog_name == "":
+                dog_name = dog_id
             gait_dir = _gait_videos_dir(dog_dir)
             if gait_dir is None:
                 continue
-            # Normals don't have visit subfolders separating baseline from
-            # post-op (they have no surgery), so take everything under the
-            # gait-videos folder.
             dog_movs = sorted(_all_movs_under(gait_dir))
-            for mov in _take(dog_movs):
+            for mov in take_limited(dog_movs):
                 out.append((mov, dog_id, dog_name, 0))
 
     return out
 
 
-# ---------------------------------------------------------------------------
-# Per-video motion analysis: lateral filter + gait window
-# ---------------------------------------------------------------------------
-
-# We sample this many evenly-spaced frames per video for the cheap motion
-# analysis. More samples → better gait-window estimation but slower. 12 is a
-# good tradeoff for 5-15s gait clips.
-N_MOTION_SAMPLES = 12
-
-# Minimum dominance ratio for "lateral" classification. dx_total / dy_total
-# must exceed this. Front/back-walking dogs have ratio near 1; true lateral
-# walking yields ratios of 5+ in practice.
-LATERAL_RATIO_THRESHOLD = 2.5
-
-# Minimum bbox-center horizontal travel (as a fraction of frame width) for the
-# clip to count as "actually walking". Filters out stationary shots even if
-# they're lateral in setup.
-MIN_HORIZONTAL_TRAVEL = 0.20
+# settings for motion analysis
+N_MOTION_SAMPLES = 12        # frames to sample per video
+LATERAL_RATIO_THRESHOLD = 2.5  # horizontal / vertical travel must exceed this
+MIN_HORIZONTAL_TRAVEL = 0.20   # dog must cross at least 20% of frame width
 
 
-def _sample_frame_indices(n_frames: int, n_samples: int) -> list[int]:
-    """Evenly spaced integer frame indices in [0, n_frames-1]."""
+# return evenly spaced frame indices across a video
+def _sample_frame_indices(n_frames, n_samples):
     if n_frames <= 0:
         return []
     if n_samples >= n_frames:
         return list(range(n_frames))
-    return [int(round(i * (n_frames - 1) / (n_samples - 1))) for i in range(n_samples)]
+    result = []
+    for i in range(n_samples):
+        result.append(int(round(i * (n_frames - 1) / (n_samples - 1))))
+    return result
 
 
-def _read_frames_at(video_path: Path, indices: list[int]) -> list[np.ndarray]:
-    """Read specified frames from a video. Returns BGR numpy arrays."""
+# read specific frames by index from a video file
+def _read_frames_at(video_path, indices):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return []
     frames = []
     for idx in indices:
-        # Seeking is exact for I-frames and approximate elsewhere; for our
-        # motion analysis "approximate" is fine and much faster than reading
-        # every intermediate frame.
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()
         if ok:
@@ -243,14 +154,10 @@ def _read_frames_at(video_path: Path, indices: list[int]) -> list[np.ndarray]:
     return frames
 
 
-def _detect_dog_centers(frames: list[np.ndarray]) -> list[tuple[float, float] | None]:
-    """Run RT-DETR on each sampled frame; return bbox-center (cx, cy) or None.
-
-    Importing the detector here (lazy) so just listing candidates doesn't pay
-    the model-load cost.
-    """
-    from animal_openpose import _detect_quadrupeds  # reuse the existing detector
-    centers: list[tuple[float, float] | None] = []
+# run the detector on each sampled frame and get the dog's center point
+def _detect_dog_centers(frames):
+    from animal_openpose import _detect_quadrupeds
+    centers = []
     for f in frames:
         if f is None:
             centers.append(None)
@@ -260,9 +167,7 @@ def _detect_dog_centers(frames: list[np.ndarray]) -> list[tuple[float, float] | 
         if boxes.shape[0] == 0:
             centers.append(None)
             continue
-        # If multiple animals are detected, pick the largest box — typically
-        # the main subject filling the frame. For clinical clips of a single
-        # dog this is virtually always the right choice.
+        # if multiple animals, pick the largest box
         areas = boxes[:, 2] * boxes[:, 3]
         i = int(np.argmax(areas))
         x, y, w, h = boxes[i]
@@ -270,21 +175,8 @@ def _detect_dog_centers(frames: list[np.ndarray]) -> list[tuple[float, float] | 
     return centers
 
 
-def _analyze_motion(
-    video_path: Path,
-) -> dict:
-    """Decide if a video is a usable lateral-gait clip and find the gait window.
-
-    Returns a dict with:
-        is_lateral:    bool
-        direction:     'LR' | 'RL' | None
-        start_frame:   int  (inclusive, in source-video frame indices)
-        end_frame:     int  (inclusive)
-        n_frames:      int
-        fps:           float
-        frame_size:    [width, height]
-        reason:        diagnostic note for clips we drop
-    """
+# check if a video is a usable lateral clip and find the walking window
+def _analyze_motion(video_path):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return {"is_lateral": False, "reason": "could not open"}
@@ -301,8 +193,12 @@ def _analyze_motion(
     frames = _read_frames_at(video_path, sample_idx)
     centers = _detect_dog_centers(frames)
 
-    # Need at least 4 valid detections to estimate motion meaningfully.
-    valid = [(idx, c) for idx, c in zip(sample_idx, centers) if c is not None]
+    # need at least 4 detections to measure motion
+    valid = []
+    for idx, c in zip(sample_idx, centers):
+        if c is not None:
+            valid.append((idx, c))
+
     if len(valid) < 4:
         return {
             "is_lateral": False, "n_frames": n, "fps": fps,
@@ -314,9 +210,7 @@ def _analyze_motion(
     cxs = np.array([v[1][0] for v in valid], dtype=np.float64)
     cys = np.array([v[1][1] for v in valid], dtype=np.float64)
 
-    # Cumulative absolute travel — robust to direction reversals (the dog may
-    # walk one way then back). For a static dog these are tiny; for a lateral
-    # walker dx >> dy.
+    # measure horizontal vs vertical travel to classify view
     dx_tot = float(np.abs(np.diff(cxs)).sum())
     dy_tot = float(np.abs(np.diff(cys)).sum())
     dx_norm = dx_tot / w
@@ -334,30 +228,27 @@ def _analyze_motion(
             "dx_total_px": dx_tot, "dy_total_px": dy_tot,
         }
 
-    # Direction is determined by the slope of cx over time. Positive slope
-    # (cx increases with frame index) means the dog moves right → 'LR'.
+    # positive slope means dog moved left to right
     slope = float(np.polyfit(idxs, cxs, 1)[0])
     direction = "LR" if slope > 0 else "RL"
 
-    # Gait window: trim to the longest contiguous span where the per-segment
-    # velocity exceeds a low threshold. Implementation: compute |dx/dframe|
-    # between consecutive samples, find the first/last sample exceeding 25%
-    # of the median active velocity, and use those as window boundaries.
+    # trim to the portion where the dog is actively walking
     seg_vel = np.abs(np.diff(cxs)) / np.maximum(np.diff(idxs), 1)
     if seg_vel.size == 0 or seg_vel.max() <= 0:
-        start_frame = int(idxs[0]); end_frame = int(idxs[-1])
+        start_frame = int(idxs[0])
+        end_frame = int(idxs[-1])
     else:
         active_thresh = max(seg_vel.max() * 0.25, 1.0)
         active = seg_vel >= active_thresh
         if active.any():
-            first = int(np.argmax(active))                     # first True
-            last = int(len(active) - 1 - np.argmax(active[::-1]))  # last True
+            first = int(np.argmax(active))
+            last = int(len(active) - 1 - np.argmax(active[::-1]))
             start_frame = int(idxs[first])
             end_frame = int(idxs[min(last + 1, len(idxs) - 1)])
         else:
-            start_frame = int(idxs[0]); end_frame = int(idxs[-1])
+            start_frame = int(idxs[0])
+            end_frame = int(idxs[-1])
 
-    # Clamp to valid range and ensure non-trivial window length.
     start_frame = max(0, start_frame)
     end_frame = min(n - 1, end_frame)
     if end_frame - start_frame < 4:
@@ -381,72 +272,57 @@ def _analyze_motion(
     }
 
 
-# ---------------------------------------------------------------------------
-# Cached scan + Clip materialization
-# ---------------------------------------------------------------------------
-
-def _load_view_cache() -> dict:
+# load the cached per-video analysis from disk
+def _load_view_cache():
     if VIEW_INDEX_PATH.exists():
         with open(VIEW_INDEX_PATH) as f:
             return json.load(f)
     return {}
 
 
-def _save_view_cache(cache: dict) -> None:
+# save the per-video analysis cache to disk
+def _save_view_cache(cache):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     with open(VIEW_INDEX_PATH, "w") as f:
         json.dump(cache, f, indent=2, sort_keys=True)
 
 
-def build_clip_index(
-    data_root: Path = DEFAULT_DATA_ROOT,
-    sample_per_dog: int | None = None,
-    limit_per_dog: int | None = None,
-    refresh: bool = False,
-    progress: bool = True,
-) -> list[Clip]:
-    """Return a list of usable Clip records.
-
-    Args:
-        data_root: dataset root (overridable via DOG_DATA_ROOT env var).
-        sample_per_dog: if not None, keep at most this many lateral clips per
-            dog AFTER motion analysis — controls the size of the returned list.
-        limit_per_dog: if not None, only run motion analysis on this many
-            candidates per dog — controls how much work the SCAN does. Use
-            this for fast smoke tests.
-        refresh: if True, ignore the existing view-index cache and re-analyze.
-        progress: print one line per video while analyzing.
-    """
+# main entry point - returns a list of usable Clip objects
+def build_clip_index(data_root=DEFAULT_DATA_ROOT, sample_per_dog=None, limit_per_dog=None, refresh=False, progress=True):
     candidates = list_candidate_videos(data_root, limit_per_dog=limit_per_dog)
     if not candidates:
         raise RuntimeError(
             f"No videos found under {data_root}. Set DOG_DATA_ROOT or check the path."
         )
 
-    cache = {} if refresh else _load_view_cache()
+    if refresh:
+        cache = {}
+    else:
+        cache = _load_view_cache()
+
     new_entries = 0
     cached_hits = 0
     scan_t0 = time.time()
 
-    # First pass: ensure every candidate has motion-analysis info.
+    # analyze any video not already in the cache
     for i, (path, dog_id, dog_name, label) in enumerate(candidates):
         key = str(path)
         if key in cache:
             cached_hits += 1
             continue
         if progress:
-            # Show ETA based on average analysis time so far.
             if new_entries > 0:
                 avg = (time.time() - scan_t0) / new_entries
-                remaining_count = sum(1 for p, _, _, _ in candidates[i:]
-                                      if str(p) not in cache)
+                remaining_count = 0
+                for p, _, _, _ in candidates[i:]:
+                    if str(p) not in cache:
+                        remaining_count += 1
                 eta = avg * remaining_count
                 eta_str = f"  (avg {avg:.1f}s/vid, ETA {eta/60:.1f} min for {remaining_count} new)"
             else:
                 eta_str = ""
             label_tag = "CCL " if label == 1 else "Norm"
-            print(f"  [{i+1}/{len(candidates)}] [{label_tag}] {dog_id}  "
-                  f"{path.name}{eta_str}", flush=True)
+            print(f"  [{i+1}/{len(candidates)}] [{label_tag}] {dog_id}  {path.name}{eta_str}", flush=True)
         t_v = time.time()
         try:
             info = _analyze_motion(path)
@@ -457,19 +333,16 @@ def build_clip_index(
         info["label"] = label
         cache[key] = info
         new_entries += 1
-        # Diagnostic: show classification result inline so the log shows what's keeping vs dropping.
         if progress:
             if info.get("is_lateral"):
                 print(f"      -> LATERAL ({info['direction']})  "
                       f"frames {info['start_frame']}-{info['end_frame']} of {info['n_frames']}  "
                       f"ratio={info.get('ratio', 0):.2f}  "
-                      f"({time.time() - t_v:.1f}s)",
-                      flush=True)
+                      f"({time.time() - t_v:.1f}s)", flush=True)
             else:
                 print(f"      -> dropped: {info.get('reason', '?')}  "
-                      f"({time.time() - t_v:.1f}s)",
-                      flush=True)
-        # Save incrementally so a long scan that's interrupted doesn't lose work.
+                      f"({time.time() - t_v:.1f}s)", flush=True)
+        # save every 10 videos so we don't lose progress if interrupted
         if new_entries % 10 == 0:
             _save_view_cache(cache)
 
@@ -480,9 +353,8 @@ def build_clip_index(
         print(f"  scan finished: {new_entries} newly analyzed, {cached_hits} cache hits, "
               f"{scan_elapsed:.1f}s total ({scan_elapsed/60:.1f} min)", flush=True)
 
-    # Second pass: turn keep-able cache entries into Clip records, optionally
-    # capped per dog.
-    by_dog: dict[str, list[Clip]] = {}
+    # turn cache entries into Clip objects, grouped by dog
+    by_dog = {}
     for path, dog_id, dog_name, label in candidates:
         info = cache[str(path)]
         if not info.get("is_lateral"):
@@ -498,38 +370,43 @@ def build_clip_index(
             n_frames=int(info["n_frames"]),
             fps=float(info["fps"]),
         )
-        by_dog.setdefault(dog_id, []).append(clip)
+        if dog_id not in by_dog:
+            by_dog[dog_id] = []
+        by_dog[dog_id].append(clip)
 
-    clips: list[Clip] = []
+    clips = []
     for dog_id, dog_clips in by_dog.items():
-        if sample_per_dog is not None:
-            # Spread the cap across the per-dog list so we don't bias to early
-            # filenames. Take an evenly-spaced subsample.
-            if sample_per_dog >= len(dog_clips):
-                kept = dog_clips
-            else:
-                step = len(dog_clips) / sample_per_dog
-                kept = [dog_clips[int(i * step)] for i in range(sample_per_dog)]
+        if sample_per_dog is not None and sample_per_dog < len(dog_clips):
+            # take evenly spaced subset to avoid biasing toward early filenames
+            kept = []
+            step = len(dog_clips) / sample_per_dog
+            for i in range(sample_per_dog):
+                kept.append(dog_clips[int(i * step)])
             clips.extend(kept)
         else:
             clips.extend(dog_clips)
+
     return clips
 
 
-# ---------------------------------------------------------------------------
-# CLI for inspecting / building the cache
-# ---------------------------------------------------------------------------
-
-def _print_summary(clips: list[Clip]) -> None:
-    by_dog: dict[str, list[Clip]] = {}
+# print a per-dog summary of how many clips we have
+def _print_summary(clips):
+    by_dog = {}
     for c in clips:
-        by_dog.setdefault(c.dog_id, []).append(c)
+        if c.dog_id not in by_dog:
+            by_dog[c.dog_id] = []
+        by_dog[c.dog_id].append(c)
     print()
     print(f"=== {len(clips)} usable lateral clips across {len(by_dog)} dogs ===")
     for dog_id in sorted(by_dog):
         dc = by_dog[dog_id]
-        lr = sum(1 for c in dc if c.direction == "LR")
-        rl = sum(1 for c in dc if c.direction == "RL")
+        lr = 0
+        rl = 0
+        for c in dc:
+            if c.direction == "LR":
+                lr += 1
+            else:
+                rl += 1
         label = "CCL " if dc[0].label == 1 else "Norm"
         print(f"  [{label}] {dog_id:35s}  total={len(dc):3d}  LR={lr:3d}  RL={rl:3d}")
 
@@ -537,13 +414,9 @@ def _print_summary(clips: list[Clip]) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Build/inspect the lateral-clip index.")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--sample", type=int, default=None,
-                        help="Keep at most N clips per dog in the final index.")
-    parser.add_argument("--limit-per-dog", type=int, default=None,
-                        help="Only motion-analyze at most N videos per dog "
-                             "(smoke-test mode; full scan is slow).")
-    parser.add_argument("--refresh", action="store_true",
-                        help="Re-analyze all videos even if cached.")
+    parser.add_argument("--sample", type=int, default=None)
+    parser.add_argument("--limit-per-dog", type=int, default=None)
+    parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
 

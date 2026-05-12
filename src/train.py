@@ -1,37 +1,4 @@
-"""Train the CCL-vs-healthy binary classifier.
-
-Reads `results/features.csv` (built by `features.py`), splits off a held-out
-test set of 1 CCL dog + 1 Normal dog, then runs leave-one-dog-out (LOO) CV
-on the rest of the dogs to compare three classifiers:
-
-    - LogisticRegression  (cheap, interpretable, baseline)
-    - RandomForest        (handles non-linear interactions, robust to scale)
-    - XGBoost             (typically the strongest tabular model on small data)
-
-Why grouped CV (by dog) instead of random?
-    Two clips from the same dog share traits — gait kinematics, body size,
-    camera setup. A random clip-level split would let the model "memorize"
-    the dog instead of learning injury signal, inflating apparent accuracy
-    by 10-30 points. The reported AUC under LOO-by-dog is the honest
-    out-of-distribution-dog estimate the downstream paper should cite.
-
-Per-dog scoring:
-    Each fold tests on all clips from one held-out dog. We report both
-    clip-level AUC/acc (treating every clip independently) and dog-level
-    accuracy (majority-vote across the dog's clips). Dog-level is the more
-    clinically meaningful number — you'd diagnose a dog, not a video.
-
-Outputs:
-    results/cv_metrics.json     # per-model LOO scores
-    results/model.joblib        # the winning classifier, refit on full train set
-    results/holdout_dogs.json   # which two dogs are in the test set
-
-Run:
-    python src/train.py
-    python src/train.py --holdout-ccl "Reggie Bell 927479" --holdout-normal "..."
-"""
-
-from __future__ import annotations
+# train.py - runs cross-validation across three classifiers and saves the best one
 
 import argparse
 import json
@@ -59,67 +26,58 @@ MODEL_PATH = RESULTS_DIR / "model.joblib"
 HOLDOUT_PATH = RESULTS_DIR / "holdout_dogs.json"
 
 
-# ---------------------------------------------------------------------------
-# Model zoo — each is a sklearn-compatible Pipeline that includes imputation
-# (some features are NaN when a clip's pose data is too sparse) and, for
-# distance-based models, scaling. Tree models don't need scaling.
-# ---------------------------------------------------------------------------
+# build the three candidate classifier pipelines
+def _make_models():
+    logreg = Pipeline([
+        ("impute", SimpleImputer(strategy="median")),
+        ("scale", StandardScaler()),
+        ("clf", LogisticRegression(
+            max_iter=2000, C=1.0, class_weight="balanced", solver="liblinear",
+        )),
+    ])
 
-def _make_models() -> dict[str, Pipeline]:
-    """Three classifiers with sensible small-data hyperparameters.
+    random_forest = Pipeline([
+        ("impute", SimpleImputer(strategy="median")),
+        ("clf", RandomForestClassifier(
+            n_estimators=400, max_depth=6, min_samples_leaf=3,
+            class_weight="balanced", random_state=0, n_jobs=-1,
+        )),
+    ])
 
-    All use class_weight / scale_pos_weight = balanced so the slight class
-    imbalance (7 CCL vs 8 Normal dogs) doesn't bias the boundary.
-    """
+    # xgboost handles nan natively so no imputer needed
+    xgboost = Pipeline([
+        ("clf", xgb.XGBClassifier(
+            n_estimators=300, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=1.0,
+            random_state=0, n_jobs=-1, eval_metric="logloss",
+        )),
+    ])
+
     return {
-        "logreg": Pipeline([
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler()),
-            # L2-regularized; small-ish C since we have lots of features
-            # relative to clips.
-            ("clf", LogisticRegression(
-                max_iter=2000, C=1.0, class_weight="balanced", solver="liblinear",
-            )),
-        ]),
-        "random_forest": Pipeline([
-            ("impute", SimpleImputer(strategy="median")),
-            ("clf", RandomForestClassifier(
-                n_estimators=400, max_depth=6, min_samples_leaf=3,
-                class_weight="balanced", random_state=0, n_jobs=-1,
-            )),
-        ]),
-        "xgboost": Pipeline([
-            # XGBoost handles NaNs natively (treats them as a third branch),
-            # so no imputer needed — but we keep the column order stable.
-            ("clf", xgb.XGBClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8,
-                reg_alpha=0.1, reg_lambda=1.0,
-                random_state=0, n_jobs=-1, eval_metric="logloss",
-            )),
-        ]),
+        "logreg": logreg,
+        "random_forest": random_forest,
+        "xgboost": xgboost,
     }
 
 
-# ---------------------------------------------------------------------------
-# Holdout selection
-# ---------------------------------------------------------------------------
-
-def _pick_holdout(df: pd.DataFrame,
-                  ccl_dog: str | None,
-                  normal_dog: str | None) -> tuple[str, str]:
-    """Return (ccl_dog_id, normal_dog_id) chosen for the held-out test set.
-
-    Defaults: pick the lexicographically last dog in each class — deterministic
-    and reproducible. Override with explicit dog ids on the command line if you
-    want to use specific dogs.
-    """
-    ccl_dogs = sorted(df.loc[df["label"] == 1, "dog_id"].unique())
-    norm_dogs = sorted(df.loc[df["label"] == 0, "dog_id"].unique())
+# pick which dogs to hold out for the final test set
+def _pick_holdout(df, ccl_dog, normal_dog):
+    ccl_rows = df.loc[df["label"] == 1]
+    ccl_dogs = sorted(ccl_rows["dog_id"].unique())
+    norm_rows = df.loc[df["label"] == 0]
+    norm_dogs = sorted(norm_rows["dog_id"].unique())
     if not ccl_dogs or not norm_dogs:
         raise RuntimeError("Need at least one CCL and one Normal dog in features.csv.")
-    chosen_ccl = ccl_dog or ccl_dogs[-1]
-    chosen_norm = normal_dog or norm_dogs[-1]
+    # default to the last dog alphabetically if not specified
+    if ccl_dog is not None:
+        chosen_ccl = ccl_dog
+    else:
+        chosen_ccl = ccl_dogs[-1]
+    if normal_dog is not None:
+        chosen_norm = normal_dog
+    else:
+        chosen_norm = norm_dogs[-1]
     if chosen_ccl not in ccl_dogs:
         raise ValueError(f"--holdout-ccl '{chosen_ccl}' not in CCL dogs: {ccl_dogs}")
     if chosen_norm not in norm_dogs:
@@ -127,22 +85,8 @@ def _pick_holdout(df: pd.DataFrame,
     return chosen_ccl, chosen_norm
 
 
-# ---------------------------------------------------------------------------
-# Cross-validation
-# ---------------------------------------------------------------------------
-
-def _per_dog_predictions(
-    pipe: Pipeline,
-    X: pd.DataFrame,
-    y: np.ndarray,
-    groups: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Run leave-one-dog-out CV. Returns (clip_pred, clip_proba, clip_true,
-    clip_group) — one entry per clip across all folds.
-
-    Suppresses LR convergence warnings on tiny folds — they don't indicate a
-    real problem here.
-    """
+# run leave-one-dog-out cross-validation and collect out-of-fold predictions
+def _per_dog_predictions(pipe, X, y, groups):
     logo = LeaveOneGroupOut()
     n = len(X)
     pred = np.zeros(n, dtype=int)
@@ -154,28 +98,24 @@ def _per_dog_predictions(
         for fold_idx, (tr, te) in enumerate(logo.split(X, y, groups)):
             pipe.fit(X.iloc[tr], y[tr])
             pred[te] = pipe.predict(X.iloc[te])
-            # predict_proba returns shape (n, 2); column 1 is P(label=1) = injured.
             proba[te] = pipe.predict_proba(X.iloc[te])[:, 1]
+
     return pred, proba, true, groups
 
 
-def _summarize_cv(pred, proba, true, groups) -> dict:
-    """Compute clip-level and dog-level metrics from out-of-fold predictions."""
+# compute clip-level and dog-level metrics from out-of-fold predictions
+def _summarize_cv(pred, proba, true, groups):
     out = {
         "n_clips": int(len(true)),
         "n_dogs": int(len(np.unique(groups))),
         "clip_accuracy": float(accuracy_score(true, pred)),
     }
-    # AUC requires both classes to be present and probabilities. If one class
-    # is missing in `true` (shouldn't happen for sensible holdouts) we return
-    # NaN.
     try:
         out["clip_auc"] = float(roc_auc_score(true, proba))
     except ValueError:
         out["clip_auc"] = float("nan")
 
-    # Aggregate to dog level: a dog is predicted CCL if MEAN of its clip
-    # probabilities is >= 0.5. Dog true label is the same across its clips.
+    # aggregate clip probabilities per dog and score at the dog level
     df = pd.DataFrame({"true": true, "proba": proba, "group": groups})
     dog_agg = df.groupby("group").agg(
         true=("true", "first"),
@@ -187,20 +127,21 @@ def _summarize_cv(pred, proba, true, groups) -> dict:
         out["dog_auc"] = float(roc_auc_score(dog_agg["true"], dog_agg["proba_mean"]))
     except ValueError:
         out["dog_auc"] = float("nan")
+
     return out
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
+# holdout_ccl and holdout_normal can be passed directly from main.py
+# if not passed, we read them from command line arguments
+def main(holdout_ccl=None, holdout_normal=None):
     p = argparse.ArgumentParser(description="Train CCL-vs-healthy classifier.")
-    p.add_argument("--holdout-ccl", type=str, default=None,
-                   help="Dog id (folder name) of the CCL dog to hold out for final test.")
-    p.add_argument("--holdout-normal", type=str, default=None,
-                   help="Dog id of the Normal dog to hold out for final test.")
-    args = p.parse_args()
+    p.add_argument("--holdout-ccl", type=str, default=None)
+    p.add_argument("--holdout-normal", type=str, default=None)
+    args, _ = p.parse_known_args()
+    if args.holdout_ccl is not None:
+        holdout_ccl = args.holdout_ccl
+    if args.holdout_normal is not None:
+        holdout_normal = args.holdout_normal
 
     if not FEATURES_CSV.exists():
         raise SystemExit(f"{FEATURES_CSV} missing — run features.py first.")
@@ -209,13 +150,17 @@ def main():
         raise SystemExit("features.csv is empty.")
 
     feat_cols = feature_columns()
-    missing_cols = [c for c in feat_cols if c not in df.columns]
+    missing_cols = []
+    for c in feat_cols:
+        if c not in df.columns:
+            missing_cols.append(c)
     if missing_cols:
         raise SystemExit(f"features.csv is missing columns: {missing_cols}")
 
-    holdout_ccl, holdout_norm = _pick_holdout(df, args.holdout_ccl, args.holdout_normal)
+    holdout_ccl, holdout_norm = _pick_holdout(df, holdout_ccl, holdout_normal)
     print(f"Holdout dogs:  CCL = {holdout_ccl!r}    Normal = {holdout_norm!r}")
 
+    # split off the holdout dogs - they won't be used for training or cv
     is_holdout = df["dog_id"].isin([holdout_ccl, holdout_norm])
     train_df = df.loc[~is_holdout].reset_index(drop=True)
     test_df = df.loc[is_holdout].reset_index(drop=True)
@@ -232,9 +177,8 @@ def main():
     y_train = train_df["label"].astype(int).to_numpy()
     groups_train = train_df["dog_id"].to_numpy()
 
-    # ---- Run LOO CV for each candidate model -----------------------------
     print("=== Leave-one-dog-out cross-validation ===")
-    cv_results: dict[str, dict] = {}
+    cv_results = {}
     for name, pipe in _make_models().items():
         try:
             pred, proba, true, groups = _per_dog_predictions(pipe, X_train, y_train, groups_train)
@@ -249,26 +193,38 @@ def main():
                   f"clip acc={metrics['clip_accuracy']:.3f}    "
                   f"DOG AUC={metrics['dog_auc']:.3f}  DOG acc={metrics['dog_accuracy']:.3f}")
 
-    # ---- Pick winner by DOG-level AUC (the clinically meaningful metric)
-    valid = {n: m for n, m in cv_results.items()
-             if "error" not in m and not np.isnan(m.get("dog_auc", np.nan))}
+    # pick the winner by dog-level auc (clinically meaningful)
+    valid = {}
+    for n, m in cv_results.items():
+        if "error" not in m and not np.isnan(m.get("dog_auc", np.nan)):
+            valid[n] = m
     if not valid:
-        # Fall back to clip-level if dog-level AUC was NaN for everyone
-        # (e.g. only one dog in training).
-        valid = {n: m for n, m in cv_results.items() if "error" not in m}
+        valid = {}
+        for n, m in cv_results.items():
+            if "error" not in m:
+                valid[n] = m
     if not valid:
         raise SystemExit("All models errored during CV.")
-    winner = max(valid, key=lambda n: valid[n].get("dog_auc",
-                                                    valid[n].get("clip_auc", -1)))
+
+    # find the model with the highest dog-level auc score
+    best_name = None
+    best_score = -1.0
+    for n in valid:
+        score = valid[n].get("dog_auc", valid[n].get("clip_auc", -1))
+        if score > best_score:
+            best_score = score
+            best_name = n
+    winner = best_name
     print(f"\nBest model by dog-level AUC: {winner}  "
           f"(dog AUC={valid[winner].get('dog_auc'):.3f}, "
           f"dog acc={valid[winner].get('dog_accuracy'):.3f})")
 
-    # ---- Refit winner on full training set, persist artifacts ------------
+    # refit the winning model on all training data and save it
     winning_pipe = _make_models()[winner]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         winning_pipe.fit(X_train, y_train)
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     joblib.dump({
         "pipeline": winning_pipe,
