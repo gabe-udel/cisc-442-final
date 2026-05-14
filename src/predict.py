@@ -143,7 +143,7 @@ def predict_video(video_path: Path, force: bool = False, save_overlay: bool = Tr
             f"Trained model not found at {MODEL_PATH}. Run train.py first."
         )
 
-    # --- 1. Motion analysis ------------------------------------------------
+    # 1. Motion analysis 
     # Gives us direction (LR/RL) and the gait-window frames the model expects.
     print(f"=== [1/4] Motion analysis: {video_path.name} ===")
     info = _analyze_motion(video_path)
@@ -155,7 +155,6 @@ def predict_video(video_path: Path, force: bool = False, save_overlay: bool = Tr
                 f"trained on lateral views, so a prediction would be unreliable. "
                 f"Pass --force to override."
             )
-        # Override path: backfill anything _analyze_motion didn't populate.
         # n_frames/fps may be missing if analysis failed before metadata read.
         if "n_frames" not in info or "fps" not in info:
             info.update(_read_video_metadata(video_path))
@@ -170,10 +169,8 @@ def predict_video(video_path: Path, force: bool = False, save_overlay: bool = Tr
     print(f"  fps:           {info['fps']:.1f}")
     print(f"  duration:      {(info['end_frame'] - info['start_frame'] + 1) / info['fps']:.1f}s")
 
-    # --- 2. Feature extraction --------------------------------------------
     # Build a Clip record so we can reuse features.extract_clip_row, which is
     # the exact function used during training — guarantees feature parity.
-    # `label` is a placeholder; predict_proba doesn't read it.
     clip = Clip(
         video_path=str(video_path),
         dog_id="<single-clip>",
@@ -195,7 +192,7 @@ def predict_video(video_path: Path, force: bool = False, save_overlay: bool = Tr
         ts = _pose_with_overlay(clip, overlay_path)
         feats = _aggregate_features(clip, ts)
         # Mirror extract_clip_row's output shape so the rest of the function
-        # treats `row` identically whether overlay was on or off.
+        # treats row identi\cally whether overlay was on or off.
         row = {
             "video_path": clip.video_path,
             "dog_id": clip.dog_id,
@@ -206,7 +203,6 @@ def predict_video(video_path: Path, force: bool = False, save_overlay: bool = Tr
     else:
         row = extract_clip_row(clip)
 
-    # --- 3. Load model ----------------------------------------------------
     print(f"\n=== [3/4] Loading classifier ===")
     artifact = joblib.load(MODEL_PATH)
     pipe = artifact["pipeline"]
@@ -214,9 +210,6 @@ def predict_video(video_path: Path, force: bool = False, save_overlay: bool = Tr
     model_name = artifact.get("model_name", "?")
     print(f"  model: {model_name}")
 
-    # --- 4. Predict --------------------------------------------------------
-    # Wrap the feature row in a 1-row DataFrame with stable column order so
-    # the pipeline's imputer/scaler see exactly what they were fit on.
     X = pd.DataFrame([{c: row.get(c, np.nan) for c in feat_cols}])
     proba_ccl = float(pipe.predict_proba(X)[0, 1])
     pred = int(proba_ccl >= 0.5)

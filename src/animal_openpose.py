@@ -1,26 +1,14 @@
 """Animal pose estimation — RT-DETR detector + SuperAnimal-Quadruped HRNet-W32.
 
-Why this stack? CCL (cranial cruciate ligament) injury manifests as asymmetric
-rear-stifle (knee) mechanics. The SuperAnimal-Quadruped model from the
-DeepLabCut model zoo predicts 39 keypoints — multiple per limb segment, with
-distinct rear-leg "knee" (true stifle) and "thai/thigh" landmarks — which is
-the resolution we need for the downstream healthy-vs-injured classifier.
-The earlier ViTPose+/AP-10K head only had 17 points (one rear knee per side),
-giving the classifier far less to work with.
+SuperAnimal-Quadruped is used to record poses for videos.
+This model is superior in that it predicts 39 keypoints, in comparison to 17 keypoints from competitors.
 
 Pipeline:
     BGR image (numpy)
         -> RT-DETR detects animal bounding boxes
         -> for each box: top-down crop -> HRNet-W32 -> 39 keypoint heatmaps
         -> compute named joint angles (rear stifle / hip emphasized for CCL)
-        -> (optionally) draw skeleton onto image
-
-Why we run HRNet ourselves instead of the `deeplabcut` package:
-    `deeplabcut` pins numpy<2 and pulls in `tables`/`blosc2`, both of which
-    fail to install cleanly on Python 3.13 / aarch64. We use `dlclibrary`
-    (lightweight) only to fetch the official PyTorch checkpoint from
-    HuggingFace, then load it into a timm HRNet backbone + a 1x1 deconv
-    pose head — which is exactly what DLC's PyTorch implementation runs.
+        -> draw skeleton onto image optionally
 """
 
 from __future__ import annotations
@@ -40,28 +28,22 @@ import cv2
 from PIL import Image
 
 # Detector (animal bounding boxes) — kept from the previous pipeline because
-# RT-DETR already works well on COCO animals and avoids re-introducing yet
-# another model dependency.
+# RT-DETR already works well on COCO animals
 from transformers import AutoProcessor, RTDetrForObjectDetection
 
 
-# ---------------------------------------------------------------------------
 # Model identifiers
-# ---------------------------------------------------------------------------
-
-# RT-DETR: COCO-trained detector. Same as before.
+# RT-DETR, COCO-trained detector
 DETECTOR_ID = "PekingU/rtdetr_r50vd_coco_o365"
 
 # SuperAnimal-Quadruped pose checkpoint name (looked up via dlclibrary).
-# The .pt file is fetched lazily from HuggingFace to ~/.cache/superanimal/.
+# The .pt file is fetched from HuggingFace to ~/.cache/superanimal/.
 POSE_MODEL_NAME = "superanimal_quadruped_hrnet_w32"
 POSE_CACHE_DIR = Path.home() / ".cache" / "superanimal"
 
 
-# ---------------------------------------------------------------------------
-# Keypoint metadata — SuperAnimal-Quadruped's 39-point AP-36K-derived schema.
-# Order MUST match the model's output channels exactly.
-# ---------------------------------------------------------------------------
+# keypoint metadata copied from huggingface
+# Order MUST match the model's output channels exactly
 
 KEYPOINT_NAMES = [
     "nose", "upper_jaw", "lower_jaw", "mouth_end_right", "mouth_end_left",
@@ -116,12 +98,11 @@ EDGES = [(NAME_TO_INDEX[a], NAME_TO_INDEX[b]) for a, b in EDGES_BY_NAME]
 # Rear stifle and hip are the CCL-diagnostic angles — those should drive the
 # downstream classifier the hardest.
 ANGLE_TRIPLETS_BY_NAME = {
-    # Rear (most diagnostic for CCL)
+    # Rear (most confident that these will be the features that affect CCL predictions)
     "L_stifle":   ("back_left_thai",  "back_left_knee",  "back_left_paw"),
     "R_stifle":   ("back_right_thai", "back_right_knee", "back_right_paw"),
     "L_hip":      ("back_base",       "back_left_thai",  "back_left_knee"),
     "R_hip":      ("back_base",       "back_right_thai", "back_right_knee"),
-    # Front (compensatory loading shows up here)
     "L_elbow":    ("front_left_thai",  "front_left_knee",  "front_left_paw"),
     "R_elbow":    ("front_right_thai", "front_right_knee", "front_right_paw"),
     "L_shoulder": ("neck_base", "front_left_thai",  "front_left_knee"),
@@ -135,19 +116,16 @@ ANGLE_TRIPLETS = {
     for name, (a, b, c) in ANGLE_TRIPLETS_BY_NAME.items()
 }
 
-# Per-instance overlay colors, BGR. Cycled if more animals than colors.
 PER_INSTANCE_COLORS = [
     (0, 165, 255), (50, 200, 50), (200, 0, 200),
     (0, 255, 255), (255, 100, 100), (50, 50, 255),
 ]
 
-# Heatmap-peak score below which we treat a keypoint as unreliable: skip
-# drawing it, and exclude any angle that depends on it.
+# heatmap-peak score below which we treat a keypoint as unreliable: skip
+# drawing it, and exclude any angle that depends on it. .33 is a good middle ground i've found. 
+# Also, we should be okay with some unreliable angles. SOME.
 DEFAULT_SCORE_THRESHOLD = 0.33
 
-# Pose model input size. HRNet-W32 is fully convolutional so it accepts any
-# size, but matching the training configuration (256x256 for SuperAnimal HRNet)
-# gives the cleanest accuracy.
 POSE_INPUT_SIZE = 256
 # Heatmaps come out at 1/4 of the input resolution (HRNet's high-res branch).
 POSE_HEATMAP_STRIDE = 4
@@ -187,11 +165,6 @@ def _move_to_device(model):
             torch.cuda.empty_cache()
     return model.to("cpu"), "cpu"
 
-
-# ---------------------------------------------------------------------------
-# Detector loader (RT-DETR — unchanged from prior version)
-# ---------------------------------------------------------------------------
-
 @lru_cache(maxsize=1)
 def _load_detector():
     proc = AutoProcessor.from_pretrained(DETECTOR_ID)
@@ -227,33 +200,19 @@ def _detect_quadrupeds(image: Image.Image, threshold: float = 0.3) -> np.ndarray
     return np.array(boxes_xywh, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# SuperAnimal-Quadruped pose model: timm HRNet-W32 + 1x1 deconv head
-# ---------------------------------------------------------------------------
+# SuperAnimal-Quadruped pose model
 
 class SuperAnimalQuadrupedPose(nn.Module):
-    """Top-down pose estimator: HRNet-W32 high-res branch + 39-channel head.
-
-    Mirrors DeepLabCut's PyTorch SuperAnimal-Quadruped construction exactly so
-    the published checkpoint loads with strict=True (after we strip the
-    `backbone.model.` / `heads.bodypart.heatmap_head.` prefixes used by DLC).
+    """
+    Mirrors DeepLabCut's PyTorch SuperAnimal-Quadruped construction exactly
     """
 
     def __init__(self, num_keypoints: int = 39):
         super().__init__()
-        # Lazy timm import — avoids a hard dependency for users who only want
-        # to read the constants/utilities at the top of this file.
         import timm
         self.backbone = timm.create_model("hrnet_w32", pretrained=False)
-        # Disable timm's built-in classification path: setting these to None
-        # makes `forward_features` return the raw 4-branch HRNet output (a list
-        # of feature maps at decreasing resolutions). We only need the
-        # high-resolution one (32 channels at 1/4 input scale).
         self.backbone.incre_modules = None
         self.backbone.downsamp_modules = None
-        # The pose head is a single 1x1 transposed conv mapping the 32-channel
-        # high-res branch to `num_keypoints` heatmap channels — that's literally
-        # all DLC's bodypart head is for SuperAnimal-Quadruped HRNet-W32.
         self.heatmap_head = nn.ConvTranspose2d(32, num_keypoints, kernel_size=1, stride=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -280,7 +239,7 @@ def _ensure_pose_weights() -> Path:
         # Fallback: glob in case the name differs by version.
         candidates = list(POSE_CACHE_DIR.glob("*.pt"))
         if not candidates:
-            raise RuntimeError(f"Pose weights not found in {POSE_CACHE_DIR} after download.")
+            raise RuntimeError(f"Pose weights not found in {POSE_CACHE_DIR} after download.") #really should not see this.
         weight_path = candidates[0]
     return weight_path
 
@@ -315,22 +274,17 @@ def _load_pose_model():
     # (final_layer, classifier) we don't load — we only care about the backbone
     # branches and our pose head, both of which DO get loaded.
     missing, unexpected = model.load_state_dict(remapped, strict=False)
-    # Sanity: anything classifier-related is fine to be missing; anything else
-    # signals a real architecture mismatch.
+    # Sanity: anything classifier-related is fine to be missing but we should be worried otherwise
     bad_missing = [k for k in missing
                    if not k.startswith(("backbone.classifier", "backbone.final_layer"))]
     if bad_missing or unexpected:
-        print(f"[animal_openpose] WARNING — missing: {bad_missing[:3]}{'...' if len(bad_missing) > 3 else ''}, "
-              f"unexpected: {unexpected[:3]}{'...' if len(unexpected) > 3 else ''}")
+        print(f"MISSING ELEMTNS OF POSE MODEL!! UH OH")
     model, device = _move_to_device(model)
     model.eval()
     return model, device
 
 
-# ---------------------------------------------------------------------------
 # Top-down pose inference: crop around bbox -> resize -> network -> decode
-# ---------------------------------------------------------------------------
-
 def _square_padded_crop_box(
     bbox_xywh: np.ndarray,
     img_w: int,
@@ -363,8 +317,7 @@ def _crop_with_padding(image_rgb: np.ndarray, x0: int, y0: int, side: int) -> np
     sx0 = max(0, x0); sy0 = max(0, y0)
     sx1 = min(w, x0 + side); sy1 = min(h, y0 + side)
     if sx1 <= sx0 or sy1 <= sy0:
-        return out  # crop is entirely outside the image — return blank
-    # Where in the output buffer the valid region lands.
+        return out  # crop is entirely outside the image
     dx0, dy0 = sx0 - x0, sy0 - y0
     out[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)] = image_rgb[sy0:sy1, sx0:sx1]
     return out
@@ -386,8 +339,7 @@ def _decode_heatmaps(heatmaps: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     # input-image-pixel coords.
     coords = torch.stack([xs, ys], dim=1).cpu().numpy().astype(np.float32)
     scores_np = scores.cpu().numpy().astype(np.float32)
-    # Clip very-negative logits to 0 so threshold comparisons behave intuitively.
-    # SuperAnimal heatmaps are roughly in [0, 1+] for confident peaks; below 0
+    # SuperAnimal heatmaps are roughly in [0, 1+] for confident peaks and below 0
     # never represents a real detection.
     scores_np = np.clip(scores_np, 0.0, None)
     return coords, scores_np
@@ -411,7 +363,6 @@ def _estimate_pose_for_boxes(
     for box in boxes_xywh:
         x0, y0, side, _ = _square_padded_crop_box(box, W, H)
         if side <= 0:
-            # Degenerate bbox — skip (pose inference would fail or return garbage).
             crop_meta.append(None)
             continue
         crop = _crop_with_padding(image_rgb, x0, y0, side)
@@ -430,7 +381,7 @@ def _estimate_pose_for_boxes(
 
     batch = torch.stack(crops_tensor).to(device)
     with torch.no_grad():
-        heatmaps = model(batch)  # shape (N, 39, H/4, W/4) where H=W=256 → 64x64
+        heatmaps = model(batch)  # shape (N, 39, H/4, W/4) where H=W=256 -> 64x64
 
     # Decode each heatmap stack and map back to image coords.
     results = []
@@ -454,12 +405,9 @@ def _estimate_pose_for_boxes(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Geometry + per-instance assembly
-# ---------------------------------------------------------------------------
-
 def _angle_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     """Angle at vertex b in degrees, given points a, b, c as (x, y)."""
+    #cool part, some fun trig
     v1 = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
     v2 = np.asarray(c, dtype=np.float64) - np.asarray(b, dtype=np.float64)
     n1 = float(np.linalg.norm(v1))
@@ -502,10 +450,6 @@ def _build_instances(
     return instances
 
 
-# ---------------------------------------------------------------------------
-# Drawing
-# ---------------------------------------------------------------------------
-
 def _draw_pose(
     bgr_image: np.ndarray,
     instances: list[dict],
@@ -542,12 +486,6 @@ def _draw_pose(
 
     return bgr_image
 
-
-# ---------------------------------------------------------------------------
-# Public API — same shape as the prior ViTPose-based version, so main.py is
-# unaffected by the model swap.
-# ---------------------------------------------------------------------------
-
 def extract_pose(
     image: np.ndarray,
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
@@ -555,12 +493,12 @@ def extract_pose(
     """Run detection + pose estimation and return structured, JSON-serializable data.
 
     Args:
-        image: BGR image array (as produced by cv2.imread).
+        image: BGR image array as produced by cv2.imread.
         score_threshold: per-keypoint heatmap-peak threshold below which joint
             angles are reported as None and keypoints are skipped during drawing.
 
     Returns:
-        A dict shaped exactly like the previous AP-10K version:
+        A dict:
             {
                 "image_size": {"width": int, "height": int},
                 "edges": [(a, b), ...],

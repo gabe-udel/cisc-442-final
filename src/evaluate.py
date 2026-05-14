@@ -66,7 +66,6 @@ def main():
     print(f"Test set: {len(test_df)} clips ({(y == 1).sum()} CCL, {(y == 0).sum()} Normal)")
     print()
 
-    # ---- Clip-level metrics -----------------------------------------------
     metrics = {"model_name": model_name, "holdout": holdout, "clip": {}, "dog": {}}
     metrics["clip"]["accuracy"] = float(accuracy_score(y, pred))
     try:
@@ -97,7 +96,7 @@ def main():
     print(f"     true=CCL     -> pred(Norm)={cm[1,0]}  pred(CCL)={cm[1,1]}")
     print()
 
-    # ---- Dog-level metrics: average clip probability per dog --------------
+    #  Dog-level metrics: average clip probability per dog 
     dog_df = pd.DataFrame({
         "dog_id": test_df["dog_id"],
         "true": y,
@@ -126,7 +125,6 @@ def main():
     print(f"\n  Dog accuracy: {metrics['dog']['accuracy']:.3f}")
     print(f"  Dog AUC     : {metrics['dog']['auc']:.3f}")
 
-    # ---- Persist artifacts ------------------------------------------------
     test_df_out = test_df[["video_path", "dog_id", "dog_name", "label"]].copy()
     test_df_out["pred"] = pred
     test_df_out["proba_ccl"] = proba

@@ -12,6 +12,12 @@ Stages (toggle each via the RUN_* flags below):
     5. EVALUATE        Score the saved winner on the two held-out dogs.
 
 To configure a run, edit the CONFIGURATION section below — no CLI args needed.
+
+!!!!!!!!!!!!!
+NOTE: this file is specifically for breaking down the dataset, generating the pose inforation, and training the model.
+To TEST the model on one video, use predict.py: this will generate pose output videos in results and display the model's prediction vis stdout
+!!!!!!!!!!!!!!
+
 """
 
 from pathlib import Path
@@ -22,25 +28,24 @@ from animal_openpose import extract_pose, get_pose
 from video_io import read_video, writer_matching
 
 
-# ===========================================================================
 # CONFIGURATION
-# ===========================================================================
 # Edit these globals to control what main() does. Each RUN_* flag turns a
 # pipeline stage on or off; the per-stage settings below tune the stage.
 
-# --- Project paths (resolved relative to this file so cwd doesn't matter) ---
+
+# Project paths (resolved relative to this file so cwd doesn't matter) 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VIDEOS_DIR   = PROJECT_ROOT / "videos"
 RESULTS_DIR  = PROJECT_ROOT / "results"
 
-# --- Stage toggles ---------------------------------------------------------
+#Stage toggles 
 RUN_VISUALIZE        = True   # Stage 1: render pose on a single demo video
 RUN_BUILD_INDEX      = False  # Stage 2: scan dataset for usable lateral clips
 RUN_EXTRACT_FEATURES = False  # Stage 3: pose -> per-clip feature CSV
 RUN_TRAIN            = False  # Stage 4: LOO-CV + persist winning classifier
 RUN_EVALUATE         = False  # Stage 5: holdout-set scoring of saved model
 
-# --- Stage 1: single-video visualization -----------------------------------
+#  Stage 1: single-video visualization 
 # Path to the clip the visualization stage will pose-annotate. Relative paths
 # are resolved against VIDEOS_DIR.
 VISUALIZE_VIDEO   = "trial_sample.MOV"
@@ -49,7 +54,7 @@ VISUALIZE_VIDEO   = "trial_sample.MOV"
 SAVE_OVERLAID     = True
 SAVE_RAW          = True
 
-# --- Stage 2: dataset / clip index -----------------------------------------
+#  Stage 2: dataset / clip index -
 # Cap motion-analysis to N candidate videos per dog. None = no cap (slow:
 # full scan over ~450 videos can take >1 hr on CPU).
 INDEX_LIMIT_PER_DOG = None
@@ -58,7 +63,7 @@ INDEX_SAMPLE_PER_DOG = None
 # True = ignore view_index.json cache and re-run motion analysis on every video.
 INDEX_REFRESH_VIEWS = False
 
-# --- Stage 3: feature extraction -------------------------------------------
+#  Stage 3: feature extraction 
 # True = skip clips already present in features.csv (resume an interrupted run).
 FEATURES_RESUME = True
 
@@ -69,9 +74,7 @@ HOLDOUT_CCL_DOG    = None
 HOLDOUT_NORMAL_DOG = None
 
 
-# ===========================================================================
 # STAGE 1 — single-video pose visualization
-# ===========================================================================
 
 def format_pose_info(pose_info: dict, frame_index: int) -> str:
     """Render one frame's pose dict as a human-readable text block."""
@@ -167,10 +170,7 @@ def run_visualize() -> None:
     analyze_single_video(video_path)
 
 
-# ===========================================================================
 # STAGE 2 — dataset / clip index
-# ===========================================================================
-
 def run_build_index():
     """Stage 2 dispatcher — walk the dataset and cache lateral-clip metadata."""
     # Imported lazily so stages we don't run don't pay their import cost
@@ -186,10 +186,7 @@ def run_build_index():
     return clips
 
 
-# ===========================================================================
 # STAGE 3 — feature extraction
-# ===========================================================================
-
 def run_extract_features():
     """Stage 3 dispatcher — pose every indexed clip and build features.csv."""
     from dataset import build_clip_index
@@ -204,15 +201,14 @@ def run_extract_features():
     return build_feature_matrix(clips, resume=FEATURES_RESUME)
 
 
-# ===========================================================================
 # STAGE 4 — training
-# ===========================================================================
 
 def run_train():
     """Stage 4 dispatcher — call train.py's main with configured holdout dogs."""
-    # train.py's CLI uses argparse; rather than reach into its internals we
+    # train.py's CLI uses argparse; rather than modify it we
     # patch sys.argv to mimic the command-line invocation. Keeps train.py the
     # single source of truth for training behavior.
+    # yes this is kind of hacky ;} but it's nice to be able to run train.py from command line too
     import sys
     import train
 
@@ -228,19 +224,13 @@ def run_train():
         sys.argv = argv_save
 
 
-# ===========================================================================
 # STAGE 5 — evaluation
-# ===========================================================================
 
 def run_evaluate():
     """Stage 5 dispatcher — score the saved winning model on the holdout dogs."""
     import evaluate
     evaluate.main()
 
-
-# ===========================================================================
-# Orchestrator
-# ===========================================================================
 
 def main():
     if RUN_VISUALIZE:

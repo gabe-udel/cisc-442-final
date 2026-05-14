@@ -2,11 +2,11 @@
 
 Goal of this module
 -------------------
-Produce a tidy list of `Clip` records — one per usable video — that downstream
+Produce a tidy list of Clip records — one per usable video — that downstream
 feature extraction can iterate over without worrying about folder layout or
 view filtering.
 
-Source layout (read-only):
+Source layout:
     <DATA_ROOT>/
         CCL Cases/<DogName ID>/<DogName> Gait Videos/
             <Visit-folder>/        # we keep ONLY *Baseline* folders
@@ -28,7 +28,7 @@ The motion analysis runs once per video and is cached to
 
 Run as a module to populate / inspect the cache:
     python src/dataset.py             # full scan, cached
-    python src/dataset.py --sample 1  # 1 video per dog (smoke test)
+    python src/dataset.py --sample 1  # 1 video per dog 
 """
 
 from __future__ import annotations
@@ -47,10 +47,7 @@ import numpy as np
 from PIL import Image
 
 
-# ---------------------------------------------------------------------------
 # Paths
-# ---------------------------------------------------------------------------
-
 # Project root resolved from this file so cwd doesn't matter.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -61,15 +58,8 @@ DEFAULT_DATA_ROOT = Path(os.environ.get(
     str(PROJECT_ROOT / "videos" / "cisc442 dog videos"),
 ))
 
-# Where we cache the per-video motion analysis. Project-local so it travels
-# with the code, but ignored if the videos themselves change.
 RESULTS_DIR = PROJECT_ROOT / "results"
 VIEW_INDEX_PATH = RESULTS_DIR / "view_index.json"
-
-
-# ---------------------------------------------------------------------------
-# Data class for one usable clip
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Clip:
@@ -103,10 +93,7 @@ class Clip:
         return self.end_frame - self.start_frame + 1
 
 
-# ---------------------------------------------------------------------------
 # Filesystem walk: enumerate candidate videos before any motion analysis
-# ---------------------------------------------------------------------------
-
 def _is_baseline_folder(name: str) -> bool:
     """Folder name says 'baseline' (case-insensitive). Visits like 'Surgery',
     '6 Weeks Post Op', '8 Weeks rads', '6 months pos-op' all fail this check."""
@@ -194,18 +181,16 @@ def list_candidate_videos(
     return out
 
 
-# ---------------------------------------------------------------------------
 # Per-video motion analysis: lateral filter + gait window
-# ---------------------------------------------------------------------------
 
 # We sample this many evenly-spaced frames per video for the cheap motion
-# analysis. More samples → better gait-window estimation but slower. 12 is a
-# good tradeoff for 5-15s gait clips.
+# analysis. More samples = better gait-window estimation but slower. 12 is a
+# good tradeoff for 5-15s gait clips, but it really is flexible so long as you stay 0-50 range
 N_MOTION_SAMPLES = 12
 
 # Minimum dominance ratio for "lateral" classification. dx_total / dy_total
-# must exceed this. Front/back-walking dogs have ratio near 1; true lateral
-# walking yields ratios of 5+ in practice.
+# must exceed this. Front/back-walking dogs have ratio near 1.
+# Note this only works bc the camer is still.
 LATERAL_RATIO_THRESHOLD = 2.5
 
 # Minimum bbox-center horizontal travel (as a fraction of frame width) for the
@@ -230,9 +215,6 @@ def _read_frames_at(video_path: Path, indices: list[int]) -> list[np.ndarray]:
         return []
     frames = []
     for idx in indices:
-        # Seeking is exact for I-frames and approximate elsewhere; for our
-        # motion analysis "approximate" is fine and much faster than reading
-        # every intermediate frame.
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()
         if ok:
@@ -260,9 +242,8 @@ def _detect_dog_centers(frames: list[np.ndarray]) -> list[tuple[float, float] | 
         if boxes.shape[0] == 0:
             centers.append(None)
             continue
-        # If multiple animals are detected, pick the largest box — typically
-        # the main subject filling the frame. For clinical clips of a single
-        # dog this is virtually always the right choice.
+        # If multiple animals are detected, pick the largest box.
+        # This works pretty well in our case.
         areas = boxes[:, 2] * boxes[:, 3]
         i = int(np.argmax(areas))
         x, y, w, h = boxes[i]
@@ -314,9 +295,6 @@ def _analyze_motion(
     cxs = np.array([v[1][0] for v in valid], dtype=np.float64)
     cys = np.array([v[1][1] for v in valid], dtype=np.float64)
 
-    # Cumulative absolute travel — robust to direction reversals (the dog may
-    # walk one way then back). For a static dog these are tiny; for a lateral
-    # walker dx >> dy.
     dx_tot = float(np.abs(np.diff(cxs)).sum())
     dy_tot = float(np.abs(np.diff(cys)).sum())
     dx_norm = dx_tot / w
@@ -334,15 +312,14 @@ def _analyze_motion(
             "dx_total_px": dx_tot, "dy_total_px": dy_tot,
         }
 
-    # Direction is determined by the slope of cx over time. Positive slope
-    # (cx increases with frame index) means the dog moves right → 'LR'.
+    # Direction is determined by the slope of cx over time
     slope = float(np.polyfit(idxs, cxs, 1)[0])
     direction = "LR" if slope > 0 else "RL"
 
-    # Gait window: trim to the longest contiguous span where the per-segment
-    # velocity exceeds a low threshold. Implementation: compute |dx/dframe|
+    # Gait window: trim to the longest contiguous span where the per-segment velocity exceeds a low threshold n compute |dx/dframe|
     # between consecutive samples, find the first/last sample exceeding 25%
     # of the median active velocity, and use those as window boundaries.
+    # there is also probably a better way to do this, and do we need to to do this either?
     seg_vel = np.abs(np.diff(cxs)) / np.maximum(np.diff(idxs), 1)
     if seg_vel.size == 0 or seg_vel.max() <= 0:
         start_frame = int(idxs[0]); end_frame = int(idxs[-1])
@@ -357,7 +334,7 @@ def _analyze_motion(
         else:
             start_frame = int(idxs[0]); end_frame = int(idxs[-1])
 
-    # Clamp to valid range and ensure non-trivial window length.
+    # clamp to valid range and ensure long enough window length.
     start_frame = max(0, start_frame)
     end_frame = min(n - 1, end_frame)
     if end_frame - start_frame < 4:
@@ -380,10 +357,6 @@ def _analyze_motion(
         "dy_norm": dy_norm,
     }
 
-
-# ---------------------------------------------------------------------------
-# Cached scan + Clip materialization
-# ---------------------------------------------------------------------------
 
 def _load_view_cache() -> dict:
     if VIEW_INDEX_PATH.exists():
@@ -428,14 +401,14 @@ def build_clip_index(
     cached_hits = 0
     scan_t0 = time.time()
 
-    # First pass: ensure every candidate has motion-analysis info.
+    # ensure every candidate has motion-analysis info.
     for i, (path, dog_id, dog_name, label) in enumerate(candidates):
         key = str(path)
         if key in cache:
             cached_hits += 1
             continue
         if progress:
-            # Show ETA based on average analysis time so far.
+            #  eta based on average analysis time so far
             if new_entries > 0:
                 avg = (time.time() - scan_t0) / new_entries
                 remaining_count = sum(1 for p, _, _, _ in candidates[i:]
@@ -457,7 +430,7 @@ def build_clip_index(
         info["label"] = label
         cache[key] = info
         new_entries += 1
-        # Diagnostic: show classification result inline so the log shows what's keeping vs dropping.
+        # show classification result inline so the log shows what's keeping vs dropping.
         if progress:
             if info.get("is_lateral"):
                 print(f"      -> LATERAL ({info['direction']})  "
@@ -469,7 +442,6 @@ def build_clip_index(
                 print(f"      -> dropped: {info.get('reason', '?')}  "
                       f"({time.time() - t_v:.1f}s)",
                       flush=True)
-        # Save incrementally so a long scan that's interrupted doesn't lose work.
         if new_entries % 10 == 0:
             _save_view_cache(cache)
 
@@ -516,10 +488,7 @@ def build_clip_index(
     return clips
 
 
-# ---------------------------------------------------------------------------
 # CLI for inspecting / building the cache
-# ---------------------------------------------------------------------------
-
 def _print_summary(clips: list[Clip]) -> None:
     by_dog: dict[str, list[Clip]] = {}
     for c in clips:

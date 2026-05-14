@@ -1,28 +1,24 @@
 """Per-clip feature extraction for the CCL vs healthy classifier.
 
-Reads the lateral-clip index from `dataset.py`, runs the SuperAnimal-Quadruped
+Reads the lateral-clip list from dataset.py, runs the SuperAnimal-Quadruped
 pose pipeline frame-by-frame over each clip's gait window, and reduces the
 resulting time series of joint angles + paw positions into a fixed-length
-feature vector. The result is written to `results/features.csv` and is the
-input to `train.py` / `evaluate.py`.
+feature vector. The result is written to results/features.csv and is the
+input to train.py / evaluate.py.
 
-Why this set of features?
     * For CCL detection we need (a) angle-magnitude signals around the rear
       stifle and hip (the affected joints) and (b) symmetry signals between
-      left and right sides (the *primary* lameness signature).
-    * Per-angle descriptive stats (mean / std / min / max / range) capture both
-      static posture and motion range.
-    * Pairwise |L-R| asymmetry stats explicitly encode the lameness signal
-      independently of which leg is injured and which side faces the camera.
+      left and right sides (the primary lameness signature).
+    * Per-angle descriptive stats (mean / std / min / max / range) let us capture range of motion
+    * |L-R| asymmetry stats encode lameness independant of which leg is closer to camera
     * Stride frequency from the back-paw y-trajectory captures cadence
-      irregularity (lame dogs often have shorter stance on the bad leg, which
-      shifts the spectrum).
-    * Stance variance ratio L/R is a proxy for "limp" — lame dogs put less
-      weight on the bad leg, so the contralateral paw moves less.
+      irregularity (lame dogs often have shorter stance on bad leg).
+    * Stance variance ratio L/R is a proxy for limping — lame dogs put less
+      weight on the bad leg
 
 Run:
-    python src/features.py                  # full extraction (slow on CPU)
-    python src/features.py --sample 1       # 1 clip per dog, smoke test
+    python src/features.py                  # full extraction (mega slow on CPU)
+    python src/features.py --sample 1       # 1 clip per dog, for testing
     python src/features.py --resume         # skip clips already in features.csv
 """
 
@@ -48,26 +44,13 @@ from animal_openpose import (
     ANGLE_TRIPLETS,
     DEFAULT_SCORE_THRESHOLD,
 )
-
-
-# ---------------------------------------------------------------------------
-# Output paths
-# ---------------------------------------------------------------------------
-
 FEATURES_CSV = RESULTS_DIR / "features.csv"
-
-
-# ---------------------------------------------------------------------------
-# Feature definitions — declared up front so columns are stable across runs
-# and so the train script can reference them without recomputing.
-# ---------------------------------------------------------------------------
 
 ANGLE_NAMES = list(ANGLE_TRIPLETS.keys())  # 10 entries
 ANGLE_STAT_NAMES = ["mean", "std", "min", "max", "range"]
 
-# Pairs whose absolute difference encodes lameness asymmetry.
 ASYM_PAIRS = [
-    ("stifle",   "L_stifle",   "R_stifle"),    # rear knees — primary CCL signal
+    ("stifle",   "L_stifle",   "R_stifle"),    # rear knees = primary CCL signal?
     ("hip",      "L_hip",      "R_hip"),
     ("elbow",    "L_elbow",    "R_elbow"),
     ("shoulder", "L_shoulder", "R_shoulder"),
@@ -77,34 +60,24 @@ ASYM_PAIRS = [
 def feature_columns() -> list[str]:
     """Stable list of feature column names for the output CSV."""
     cols: list[str] = []
-    # 50: per-angle descriptive stats
     for ang in ANGLE_NAMES:
         for stat in ANGLE_STAT_NAMES:
             cols.append(f"{ang}_{stat}")
-    # 8: L/R asymmetry stats (mean + std of |L-R| over time)
     for pair_name, _, _ in ASYM_PAIRS:
         cols.append(f"asym_{pair_name}_mean")
         cols.append(f"asym_{pair_name}_std")
-    # 2: dominant stride frequency for each back paw (Hz)
     cols.append("stride_freq_L_back_hz")
     cols.append("stride_freq_R_back_hz")
-    # 2: stance asymmetry — variance ratio of paw-y between L and R
     cols.append("stance_var_ratio_back")
     cols.append("stance_var_ratio_front")
-    # 3: metadata-as-features
     cols.append("duration_s")
     cols.append("pose_coverage")        # fraction of frames with >=1 angle defined
-    cols.append("direction_LR")         # 1 if LR (right side visible), else 0
+    cols.append("direction_LR")         # 1 if LR (right side visible), else 0. maybe does not need to be included here.
     return cols
 
 
 META_COLUMNS = ["video_path", "dog_id", "dog_name", "label"]
 ALL_COLUMNS = META_COLUMNS + feature_columns()
-
-
-# ---------------------------------------------------------------------------
-# Pose extraction over a gait window
-# ---------------------------------------------------------------------------
 
 def _iter_clip_frames(clip: Clip):
     """Yield (frame_index, BGR frame) for every frame in [start, end] inclusive.
@@ -139,11 +112,10 @@ def _extract_clip_timeseries(clip: Clip, verbose: bool = True) -> dict[str, np.n
 
     # Time series per angle.
     angles_ts = {a: np.full(win, np.nan, dtype=np.float64) for a in ANGLE_NAMES}
-    # Time series per paw — y coordinate for stride/stance, x for completeness.
     paw_keys = ["front_left_paw", "front_right_paw", "back_left_paw", "back_right_paw"]
     paws_x = {p: np.full(win, np.nan, dtype=np.float64) for p in paw_keys}
     paws_y = {p: np.full(win, np.nan, dtype=np.float64) for p in paw_keys}
-    # Dog-detected per frame (any instances).
+    # Dog-detected per frame (any instances). useful for quantifing completeness
     has_dog = np.zeros(win, dtype=bool)
 
     PROGRESS_EVERY = 20
@@ -169,8 +141,8 @@ def _extract_clip_timeseries(clip: Clip, verbose: bool = True) -> dict[str, np.n
         if not info["instances"]:
             continue
         n_with_dog += 1
-        # Use the first (typically only) detected animal. If there are several,
-        # pick the largest bbox — same heuristic the dataset module uses.
+        # Use the first (and hopefully only) detected animal. If there are several,
+        # pick the largest bbox which is what we also did in detector.py
         instances = info["instances"]
         if len(instances) > 1:
             areas = [inst["bbox_xywh"][2] * inst["bbox_xywh"][3] for inst in instances]
@@ -184,9 +156,6 @@ def _extract_clip_timeseries(clip: Clip, verbose: bool = True) -> dict[str, np.n
             if ang_name in angles_ts and val is not None:
                 angles_ts[ang_name][t] = float(val)
 
-        # Paw positions — only record if the keypoint cleared the threshold.
-        # (The pose dict already filters angles by threshold, but keypoint
-        # entries are always present, so we re-check `score`.)
         for kp in inst["keypoints"]:
             name = kp["name"]
             if name in paws_x and kp["score"] >= DEFAULT_SCORE_THRESHOLD:
@@ -200,10 +169,6 @@ def _extract_clip_timeseries(clip: Clip, verbose: bool = True) -> dict[str, np.n
         "has_dog": has_dog,
     }
 
-
-# ---------------------------------------------------------------------------
-# Feature aggregation
-# ---------------------------------------------------------------------------
 
 def _angle_stats(values: np.ndarray) -> dict[str, float]:
     """Mean/std/min/max/range, ignoring NaNs. NaN if no data."""
@@ -241,20 +206,15 @@ def _dominant_frequency(signal: np.ndarray, fps: float) -> float:
     valid = ~np.isnan(s)
     if valid.sum() < max(8, signal.size * 0.5):
         return np.nan
-    # Interpolate NaN gaps so FFT input is contiguous.
     idx = np.arange(s.size)
     s[~valid] = np.interp(idx[~valid], idx[valid], s[valid])
-    # Detrend (remove mean and linear trend) so DC + slow drift don't dominate
-    # the spectrum.
     s = s - np.mean(s)
     if s.size >= 4:
         slope = np.polyfit(idx, s, 1)
         s = s - (slope[0] * idx + slope[1])
-    # rfft gives only the positive-frequency half of the spectrum.
     spec = np.abs(np.fft.rfft(s))
     freqs = np.fft.rfftfreq(s.size, d=1.0 / fps)
-    # Skip DC bin; find max in the rest. Cap at "biological" max — dogs trot at
-    # 1-3 Hz, gallop at 3-5 Hz; nothing meaningful above ~6 Hz.
+    # nothing meaningful above ~6 Hz.
     if spec.size <= 1:
         return np.nan
     band = (freqs > 0.3) & (freqs <= 6.0)
@@ -285,19 +245,16 @@ def _aggregate_features(clip: Clip, ts: dict[str, Any]) -> dict[str, float]:
     """Reduce a clip's time series into a 65-element feature dict."""
     feats: dict[str, float] = {}
 
-    # --- 50: per-angle descriptive stats ---------------------------------
     for ang in ANGLE_NAMES:
         stats = _angle_stats(ts["angles"][ang])
         for stat_name, val in stats.items():
             feats[f"{ang}_{stat_name}"] = val
 
-    # --- 8: pairwise L/R asymmetry stats ---------------------------------
     for pair_name, l_ang, r_ang in ASYM_PAIRS:
         m, s = _asymmetry_stats(ts["angles"][l_ang], ts["angles"][r_ang])
         feats[f"asym_{pair_name}_mean"] = m
         feats[f"asym_{pair_name}_std"] = s
 
-    # --- 2: stride frequency from each back-paw y-trajectory -------------
     feats["stride_freq_L_back_hz"] = _dominant_frequency(
         ts["paws_y"]["back_left_paw"], clip.fps
     )
@@ -305,7 +262,6 @@ def _aggregate_features(clip: Clip, ts: dict[str, Any]) -> dict[str, float]:
         ts["paws_y"]["back_right_paw"], clip.fps
     )
 
-    # --- 2: stance asymmetry — variance ratio of paw-y L vs R -----------
     feats["stance_var_ratio_back"] = _variance_ratio(
         ts["paws_y"]["back_left_paw"], ts["paws_y"]["back_right_paw"]
     )
@@ -313,18 +269,12 @@ def _aggregate_features(clip: Clip, ts: dict[str, Any]) -> dict[str, float]:
         ts["paws_y"]["front_left_paw"], ts["paws_y"]["front_right_paw"]
     )
 
-    # --- 3: metadata-as-features ----------------------------------------
     win = clip.gait_length
     feats["duration_s"] = win / max(clip.fps, 1.0)
     feats["pose_coverage"] = float(np.mean(ts["has_dog"])) if win > 0 else 0.0
     feats["direction_LR"] = 1.0 if clip.direction == "LR" else 0.0
 
     return feats
-
-
-# ---------------------------------------------------------------------------
-# Top-level driver
-# ---------------------------------------------------------------------------
 
 def extract_clip_row(clip: Clip) -> dict[str, Any]:
     """Run pose on a single clip and return one CSV row's worth of data."""
@@ -347,7 +297,7 @@ def extract_clip_row(clip: Clip) -> dict[str, Any]:
         **feats,
     }
     # Show two of the diagnostic features so the user can sanity-check the run
-    # without opening the CSV.
+    # without opening csv
     stif_l = feats.get("L_stifle_mean", float("nan"))
     stif_r = feats.get("R_stifle_mean", float("nan"))
     asym_stifle = feats.get("asym_stifle_mean", float("nan"))
@@ -394,7 +344,7 @@ def build_feature_matrix(
             rows.append(extract_clip_row(clip))
         except Exception as e:
             print(f"  ! FAILED on {clip.video_path}: {e}", flush=True)
-        # Persist progressively so a kill mid-run doesn't lose hours of work.
+        # Persist progressively so a kill mid run doesnt lose hours of work. Learned the hard way.
         if rows and (i % 5 == 0 or i == len(clips_to_run)):
             partial = pd.DataFrame(rows, columns=ALL_COLUMNS)
             if existing is not None:
@@ -443,7 +393,6 @@ def main():
     print("=== Extracting features ===")
     df = build_feature_matrix(clips, resume=args.resume)
     print()
-    # Quick label distribution summary so the user knows the class balance.
     print("Label distribution:")
     print(df.groupby("label")["dog_id"].nunique().rename("dogs").to_string())
     print()
