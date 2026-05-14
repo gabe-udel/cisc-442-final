@@ -1,6 +1,6 @@
 # CISC 442 Final — Dog Gait CCL Classifier
 
-Hi! This pipeline takes a dog gait video, runs pose estimation on it, and
+This pipeline takes a dog gait video, runs pose estimation on it, and
 classifies the dog as **CCL (knee injury)** or **Normal** using a trained
 random-forest model.
 
